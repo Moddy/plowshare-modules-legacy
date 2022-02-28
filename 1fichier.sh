@@ -21,6 +21,7 @@ MODULE_1FICHIER_REGEXP_URL='https\?://\(.*\.\)\?\(1fichier\.\(com\|net\|org\|fr\
 
 MODULE_1FICHIER_DOWNLOAD_OPTIONS="
 AUTH,a,auth,a=USER:PASSWORD,Premium account
+APIKEY,,apikey,S=APIKEY,1fichier API key
 LINK_PASSWORD,p,link-password,S=PASSWORD,Used in password-protected files
 PURGE,,purgesessions,,Purge old sessions
 RESTRICT,,restrictip,,Restrict login session to my IP address"
@@ -72,6 +73,10 @@ MODULE_1FICHIER_PROBE_OPTIONS=""
 # Static function. Proper way to get file information
 # $1: 1fichier url
 # stdout: string (with ; as separator)
+# Typical output
+# https://1fichier.com/?arptmtcrqk;;;PRIVATE
+# Passworded output
+# https://1fichier.com/?arptmtcrqk;Filename;;PRIVATE
 1fichier_checklink() {
     local S FID
     S=$(curl --form-string "links[]=$1" 'https://1fichier.com/check_links.pl') || return
@@ -88,6 +93,66 @@ MODULE_1FICHIER_PROBE_OPTIONS=""
     echo "$S"
 }
 
+# Static function. Proper way to get file information
+# Uses API authentication to fetch file api JSON with basic error checking
+# $1: 1fichier url
+# stdout: json string
+1fichier_api_file_info() {
+    local FILE_INFO_PARAMS FILE_NAME API_MESSAGE S
+
+    if [ -z "$LINK_PASSWORD" ]; then
+        FILE_INFO_PARAMS="{\"url\":\"$1\"}"
+    else
+        FILE_INFO_PARAMS="{\"url\":\"$1\",\"pass\":\"$LINK_PASSWORD\"}"
+    fi
+
+    S=$(curl -X POST -H "Authorization: Bearer $APIKEY" -H 'Content-Type: application/json' -d "$FILE_INFO_PARAMS" https://api.1fichier.com/v1/file/info.cgi)
+
+    # Check for API failure
+    API_MESSAGE=$(parse_json_quiet 'message' <<< "$S")
+    if [ -n "$API_MESSAGE" ]; then
+        # TODO - Why doesn't this regex match?
+        if match "Resource not allowed" $API_MESSAGE; then
+            log_error "API Returned error. File password likely incorrect"
+        else
+            log_error "API Returned error: $API_MESSAGE"
+        fi
+        return $ERR_FATAL
+    fi
+
+    FILE_NAME=$(parse_json 'filename' <<< "$S")
+
+    echo "$S"
+}
+
+# Static function. Get file download URL/token
+# Uses API authentication
+# $1: 1fichier url
+# stdout: Download URL
+1fichier_api_download_url() {
+    local S API_STATUS API_MESSAGE FILE_DL_URL
+
+    if [ -z "$LINK_PASSWORD" ]; then
+        FILE_INFO_PARAMS="{\"url\":\"$1\"}"
+    else
+        FILE_INFO_PARAMS="{\"url\":\"$1\",\"pass\":\"$LINK_PASSWORD\"}"
+    fi
+
+    S=$(curl -X POST -H "Authorization: Bearer $APIKEY" -H 'Content-Type: application/json' -d "$FILE_INFO_PARAMS" https://api.1fichier.com/v1/download/get_token.cgi)
+
+    # Check for API failure
+    API_STATUS=$(parse_json 'status' <<< "$S")
+    API_MESSAGE=$(parse_json_quiet 'message' <<< "$S")
+    if [ "$API_STATUS" == 'OK' ]; then
+        FILE_DL_URL=$(parse_json 'url' <<< "$S")
+    else
+        log_error "API Returned error: $API_MESSAGE"
+        return $ERR_FATAL
+    fi
+
+    echo "$FILE_DL_URL"
+}
+
 # Output a 1fichier file download URL
 # $1: cookie file (account only)
 # $2: 1fichier url
@@ -98,7 +163,7 @@ MODULE_1FICHIER_PROBE_OPTIONS=""
 1fichier_download() {
     local -r COOKIE_FILE=$1
     local URL=$(replace 'http://' 'https://' <<< "$2")
-    local FID PAGE FILE_URL FILE_NAME WAIT CV SESS
+    local FID PAGE FILE_URL FILE_NAME WAIT CV SESS FILE_INFO
 
     FID=$(parse_quiet . '://\([[:alnum:]]*\)\.' <<< "$URL")
     if [ -n "$FID" ] && [ "$FID" != '1fichier' ]; then
@@ -134,8 +199,21 @@ MODULE_1FICHIER_PROBE_OPTIONS=""
 
     FILE_URL=$(curl --head -b "$COOKIE_FILE" "$URL" | \
         grep_http_header_location_quiet)
+    
+    if [ -z "$APIKEY" ]; then
+        PAGE=$(1fichier_checklink "$URL") || return
+    else
+        log_debug "using API based checklink"
+        FILE_INFO=$(1fichier_api_file_info "$URL") || return
+        FILE_URL=$(1fichier_api_download_url "$URL") || return
 
-    PAGE=$(1fichier_checklink "$URL") || return
+        FILE_NAME=$(parse_json 'filename' <<< "$FILE_INFO")
+
+        echo "$FILE_URL"
+        echo "$FILE_NAME"
+        return 0
+    fi
+
     IFS=';' read -r _ FILE_NAME _ <<< "$PAGE"
 
     if [ -z "$FILE_NAME" ]; then
